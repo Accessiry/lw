@@ -181,6 +181,8 @@ def main() -> None:
     run_dir = make_run_dir(args.output_dir, args.run_name)
     best_metric = -1.0
     best_state: Dict[str, torch.Tensor] = {}
+    best_metrics: Dict[str, float] = {}
+    best_epoch = 0
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -217,6 +219,8 @@ def main() -> None:
         if score > best_metric:
             best_metric = score
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            best_metrics = asdict(metrics)
+            best_epoch = epoch
             patience_counter = 0
         else:
             patience_counter += 1
@@ -230,9 +234,28 @@ def main() -> None:
 
     if best_state:
         torch.save(best_state, os.path.join(run_dir, "best_model.pt"))
+        best_metrics_payload = {
+            "epoch": best_epoch,
+            "best_score": best_metric,
+            **best_metrics,
+        }
+        save_json(best_metrics_payload, os.path.join(run_dir, "best_metrics.json"))
+        print(f"Best epoch {best_epoch} | score={best_metric:.4f}", flush=True)
+        if best_metrics:
+            print(
+                "  [best] acc={:.4f} precision={:.4f} recall={:.4f} f1={:.4f} mcc={:.4f}".format(
+                    best_metrics.get("accuracy", 0.0),
+                    best_metrics.get("precision", 0.0),
+                    best_metrics.get("recall", 0.0),
+                    best_metrics.get("f1", 0.0),
+                    best_metrics.get("mcc", 0.0),
+                ),
+                flush=True,
+            )
 
     summary = {
         "best_score": best_metric,
+        "best_epoch": best_epoch,
         "config": vars(args),
     }
     save_json(summary, os.path.join(run_dir, "summary.json"))
