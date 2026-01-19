@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -13,17 +14,37 @@ from fcg.models import CPGClassifier, CPGGraph
 
 
 class CPGJsonDataset(Dataset):
-    def __init__(self, jsonl_path: Path):
-        self.entries: List[Dict[str, object]] = []
-        with jsonl_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                self.entries.append(json.loads(line))
+    def __init__(self, entries: List[Dict[str, object]]):
+        self.entries = entries
 
     def __len__(self) -> int:
         return len(self.entries)
 
     def __getitem__(self, index: int) -> Dict[str, object]:
         return self.entries[index]
+
+
+def load_entries(jsonl_path: Path) -> List[Dict[str, object]]:
+    entries: List[Dict[str, object]] = []
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            entries.append(json.loads(line))
+    return entries
+
+
+def split_entries(
+    entries: List[Dict[str, object]],
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], List[Dict[str, object]]]:
+    rng = random.Random(seed)
+    shuffled = entries[:]
+    rng.shuffle(shuffled)
+    total = len(shuffled)
+    train_end = int(total * train_ratio)
+    val_end = train_end + int(total * val_ratio)
+    return shuffled[:train_end], shuffled[train_end:val_end], shuffled[val_end:]
 
 
 def build_graph(
@@ -65,13 +86,79 @@ def collate_batch(tokenizer, relation_map, batch):
     return graphs, torch.tensor(labels, dtype=torch.long)
 
 
+def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict:
+    preds = logits.argmax(dim=-1)
+    correct = (preds == labels).sum().item()
+    total = labels.numel()
+    tp = ((preds == 1) & (labels == 1)).sum().item()
+    fp = ((preds == 1) & (labels == 0)).sum().item()
+    fn = ((preds == 0) & (labels == 1)).sum().item()
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    acc = correct / total if total else 0.0
+    return {"acc": acc, "precision": precision, "recall": recall, "f1": f1}
+
+
+def evaluate(
+    classifier: CPGClassifier,
+    encoder: AutoModel,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> dict:
+    classifier.eval()
+    encoder.eval()
+    all_logits = []
+    all_labels = []
+    with torch.no_grad():
+        for graphs, labels in dataloader:
+            labels = labels.to(device)
+            logits_list = []
+            for tokens, edge_index, edge_types in graphs:
+                tokens = {k: v.to(device) for k, v in tokens.items()}
+                node_embeddings = encoder(**tokens).last_hidden_state[:, 0, :]
+                graph = CPGGraph(
+                    node_embeddings=node_embeddings,
+                    edge_index=edge_index.to(device),
+                    edge_types=edge_types.to(device),
+                )
+                logits_list.append(classifier(graph))
+            logits = torch.stack(logits_list)
+            all_logits.append(logits.cpu())
+            all_labels.append(labels.cpu())
+    if not all_logits:
+        return {"acc": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+    logits = torch.cat(all_logits, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+    return compute_metrics(logits, labels)
+
+
 def train(args: argparse.Namespace) -> None:
     relation_map = {name: idx for idx, name in enumerate(args.relations)}
-    dataset = CPGJsonDataset(Path(args.cpg_jsonl))
-    dataloader = DataLoader(
-        dataset,
+    entries = load_entries(Path(args.cpg_jsonl))
+    train_entries, val_entries, test_entries = split_entries(
+        entries,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+    )
+
+    train_loader = DataLoader(
+        CPGJsonDataset(train_entries),
         batch_size=args.batch_size,
         shuffle=True,
+        collate_fn=lambda batch: collate_batch(args.tokenizer, relation_map, batch),
+    )
+    val_loader = DataLoader(
+        CPGJsonDataset(val_entries),
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate_batch(args.tokenizer, relation_map, batch),
+    )
+    test_loader = DataLoader(
+        CPGJsonDataset(test_entries),
+        batch_size=args.batch_size,
+        shuffle=False,
         collate_fn=lambda batch: collate_batch(args.tokenizer, relation_map, batch),
     )
 
@@ -88,7 +175,7 @@ def train(args: argparse.Namespace) -> None:
     classifier.train()
     for epoch in range(args.epochs):
         total_loss = 0.0
-        for graphs, labels in dataloader:
+        for graphs, labels in train_loader:
             labels = labels.to(device)
             logits_list = []
             for tokens, edge_index, edge_types in graphs:
@@ -107,8 +194,24 @@ def train(args: argparse.Namespace) -> None:
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        avg_loss = total_loss / len(dataloader)
-        print(f"epoch={epoch + 1} loss={avg_loss:.4f}")
+        avg_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
+        val_metrics = evaluate(classifier, encoder, val_loader, device)
+        print(
+            "epoch={epoch} loss={loss:.4f} val_acc={acc:.4f} val_f1={f1:.4f}"
+            " val_precision={precision:.4f} val_recall={recall:.4f}".format(
+                epoch=epoch + 1,
+                loss=avg_loss,
+                **val_metrics,
+            )
+        )
+        classifier.train()
+
+    test_metrics = evaluate(classifier, encoder, test_loader, device)
+    print(
+        "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}".format(
+            **test_metrics
+        )
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +228,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--relations",
         nargs="+",

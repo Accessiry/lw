@@ -28,6 +28,8 @@ python scripts/train_codebert_baseline.py \
   --output-dir /home/user/mzaj/FCG/outputs/codebert
 ```
 
+By default this splits data into train/val/test (80/10/10) with a fixed seed. Adjust with `--train-ratio`, `--val-ratio`, and `--seed`.
+
 ## Baseline 2: Joern + CPG + relation-weighted GNN
 
 ### 1) Extract CPG graphson and convert to JSONL
@@ -59,6 +61,8 @@ python scripts/train_cpg_model.py \
   --model-path /home/user/PycharmProjects/pythonProject/model/codebert-base \
   --output-dir /home/user/mzaj/FCG/outputs/cpg
 ```
+
+This also uses a default 80/10/10 train/val/test split with `--train-ratio`, `--val-ratio`, and `--seed` available.
 
 ## Notes
 
