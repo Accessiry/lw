@@ -42,3 +42,12 @@ python train_file.py \
   --pooling attn \
   --edge-dropout 0.1
 ```
+
+You can also enable validation threshold search to pick a better probability cutoff for F1/MCC:
+
+```bash
+python train_file.py \
+  --data-root /home/user/mzaj/datasets/functions_npz_slow \
+  --run-name function_rgat_threshold \
+  --threshold-search
+```

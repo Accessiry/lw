@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 
@@ -12,15 +13,15 @@ class BinaryMetrics:
     mcc: float
 
 
-def compute_binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> BinaryMetrics:
-    probs = torch.softmax(logits, dim=-1)
-    preds = torch.argmax(probs, dim=-1)
-
+def _confusion_counts(preds: torch.Tensor, targets: torch.Tensor) -> Tuple[int, int, int, int]:
     tp = ((preds == 1) & (targets == 1)).sum().item()
     tn = ((preds == 0) & (targets == 0)).sum().item()
     fp = ((preds == 1) & (targets == 0)).sum().item()
     fn = ((preds == 0) & (targets == 1)).sum().item()
+    return tp, tn, fp, fn
 
+
+def _metrics_from_counts(tp: int, tn: int, fp: int, fn: int) -> BinaryMetrics:
     total = tp + tn + fp + fn
     accuracy = (tp + tn) / total if total else 0.0
     precision = tp / (tp + fp) if (tp + fp) else 0.0
@@ -37,3 +38,20 @@ def compute_binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Binar
         f1=f1,
         mcc=mcc,
     )
+
+
+def compute_binary_metrics(logits: torch.Tensor, targets: torch.Tensor) -> BinaryMetrics:
+    probs = torch.softmax(logits, dim=-1)
+    preds = torch.argmax(probs, dim=-1)
+    tp, tn, fp, fn = _confusion_counts(preds, targets)
+    return _metrics_from_counts(tp, tn, fp, fn)
+
+
+def compute_binary_metrics_at_threshold(
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float,
+) -> BinaryMetrics:
+    preds = (probs >= threshold).long()
+    tp, tn, fp, fn = _confusion_counts(preds, targets)
+    return _metrics_from_counts(tp, tn, fp, fn)

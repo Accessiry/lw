@@ -9,7 +9,11 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from dataset.graph_dataset import FunctionNPZDataset
-from metrics.binary import BinaryMetrics, compute_binary_metrics
+from metrics.binary import (
+    BinaryMetrics,
+    compute_binary_metrics,
+    compute_binary_metrics_at_threshold,
+)
 from models.classifier import GraphClassifier
 from models.rgat import RGATEncoder
 from utils.logger import make_run_dir, save_json
@@ -109,11 +113,36 @@ def train_epoch(
     return total_loss / len(loader.dataset)
 
 
+def find_best_threshold(
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    min_threshold: float,
+    max_threshold: float,
+    steps: int,
+) -> Tuple[float, BinaryMetrics]:
+    best_threshold = 0.5
+    best_metrics = compute_binary_metrics_at_threshold(probs, targets, best_threshold)
+    best_score = (best_metrics.f1 + best_metrics.mcc) / 2
+    for step in range(steps + 1):
+        threshold = min_threshold + (max_threshold - min_threshold) * (step / steps)
+        metrics = compute_binary_metrics_at_threshold(probs, targets, threshold)
+        score = (metrics.f1 + metrics.mcc) / 2
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+            best_metrics = metrics
+    return best_threshold, best_metrics
+
+
 def evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> Tuple[float, BinaryMetrics]:
+    threshold_search: bool,
+    threshold_min: float,
+    threshold_max: float,
+    threshold_steps: int,
+) -> Tuple[float, BinaryMetrics, float]:
     model.eval()
     losses = []
     all_logits = []
@@ -128,9 +157,20 @@ def evaluate(
             all_targets.append(batch.y.cpu())
     logits = torch.cat(all_logits, dim=0)
     targets = torch.cat(all_targets, dim=0)
-    metrics = compute_binary_metrics(logits, targets)
+    probs = torch.softmax(logits, dim=-1)[:, 1]
+    if threshold_search:
+        best_threshold, metrics = find_best_threshold(
+            probs,
+            targets,
+            threshold_min,
+            threshold_max,
+            threshold_steps,
+        )
+    else:
+        metrics = compute_binary_metrics(logits, targets)
+        best_threshold = 0.5
     avg_loss = sum(losses) / len(loader.dataset)
-    return avg_loss, metrics
+    return avg_loss, metrics, best_threshold
 
 
 def compute_class_weights(loader: DataLoader, device: torch.device) -> torch.Tensor:
@@ -165,6 +205,10 @@ def main() -> None:
     parser.add_argument("--pooling", type=str, choices=["mean", "max", "sum", "meanmax", "attn"], default="attn")
     parser.add_argument("--edge-dropout", type=float, default=0.1)
     parser.add_argument("--use-class-weights", action="store_true")
+    parser.add_argument("--threshold-search", action="store_true")
+    parser.add_argument("--threshold-min", type=float, default=0.05)
+    parser.add_argument("--threshold-max", type=float, default=0.95)
+    parser.add_argument("--threshold-steps", type=int, default=19)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -213,6 +257,7 @@ def main() -> None:
     best_state: Dict[str, torch.Tensor] = {}
     best_metrics: Dict[str, float] = {}
     best_epoch = 0
+    best_threshold = 0.5
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -227,7 +272,15 @@ def main() -> None:
             args.focal_gamma,
             args.label_smoothing,
         )
-        val_loss, metrics = evaluate(model, val_loader, device)
+        val_loss, metrics, threshold = evaluate(
+            model,
+            val_loader,
+            device,
+            args.threshold_search,
+            args.threshold_min,
+            args.threshold_max,
+            args.threshold_steps,
+        )
         print(
             "  [val] loss={:.4f} acc={:.4f} precision={:.4f} recall={:.4f} "
             "f1={:.4f} mcc={:.4f}".format(
@@ -251,6 +304,7 @@ def main() -> None:
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
             best_metrics = asdict(metrics)
             best_epoch = epoch
+            best_threshold = threshold
             patience_counter = 0
         else:
             patience_counter += 1
@@ -267,6 +321,7 @@ def main() -> None:
         best_metrics_payload = {
             "epoch": best_epoch,
             "best_score": best_metric,
+            "best_threshold": best_threshold,
             **best_metrics,
         }
         save_json(best_metrics_payload, os.path.join(run_dir, "best_metrics.json"))
@@ -286,6 +341,7 @@ def main() -> None:
     summary = {
         "best_score": best_metric,
         "best_epoch": best_epoch,
+        "best_threshold": best_threshold,
         "config": vars(args),
     }
     save_json(summary, os.path.join(run_dir, "summary.json"))
