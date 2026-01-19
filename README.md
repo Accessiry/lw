@@ -37,5 +37,8 @@ python train_file.py \
   --data-root /home/user/mzaj/datasets/functions_npz_slow \
   --run-name function_rgat_tuned \
   --focal-gamma 1.5 \
-  --scheduler cosine
+  --scheduler cosine \
+  --sampler balanced \
+  --pooling attn \
+  --edge-dropout 0.1
 ```

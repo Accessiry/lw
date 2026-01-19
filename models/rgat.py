@@ -1,6 +1,7 @@
 import torch
 from torch import nn
-from torch_geometric.nn import RGCNConv, JumpingKnowledge
+from torch_geometric.nn import JumpingKnowledge, RGCNConv
+from torch_geometric.utils import dropout_edge
 
 
 class RGATEncoder(nn.Module):
@@ -14,10 +15,12 @@ class RGATEncoder(nn.Module):
         use_layernorm: bool = True,
         use_residual: bool = True,
         jk_mode: str = "cat",
+        edge_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.dropout = nn.Dropout(dropout)
         self.use_residual = use_residual
+        self.edge_dropout = edge_dropout
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.convs.append(RGCNConv(in_channels, hidden_channels, num_relations))
@@ -32,7 +35,12 @@ class RGATEncoder(nn.Module):
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_type: torch.Tensor) -> torch.Tensor:
         outputs = []
         for conv in self.convs:
-            out = conv(x, edge_index, edge_type)
+            if self.edge_dropout > 0:
+                edge_index_dropped, edge_mask = dropout_edge(edge_index, p=self.edge_dropout)
+                edge_type_dropped = edge_type[edge_mask]
+                out = conv(x, edge_index_dropped, edge_type_dropped)
+            else:
+                out = conv(x, edge_index, edge_type)
             out = torch.relu(out)
             out = self.dropout(out)
             out = self.norms[len(outputs)](out)

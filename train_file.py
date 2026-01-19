@@ -2,7 +2,7 @@ import argparse
 import os
 import time
 from dataclasses import asdict
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -20,16 +20,31 @@ def build_loaders(
     root: str,
     batch_size: int,
     num_workers: int,
+    sampler: str,
 ) -> Tuple[DataLoader, DataLoader]:
     train_dataset = FunctionNPZDataset(root=root, split="train")
     val_dataset = FunctionNPZDataset(root=root, split="val")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        worker_init_fn=seed_worker,
-    )
+    if sampler == "balanced":
+        labels = torch.tensor([sample.label for sample in train_dataset.samples])
+        class_counts = torch.bincount(labels, minlength=2).float()
+        weights = (class_counts.sum() / (class_counts + 1e-6))[labels]
+        sampler_obj = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(labels), replacement=True)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=sampler_obj,
+            num_workers=num_workers,
+            worker_init_fn=seed_worker,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            worker_init_fn=seed_worker,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
@@ -43,12 +58,17 @@ def build_loaders(
 def compute_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    class_weights: torch.Tensor,
+    class_weights: Optional[torch.Tensor],
     focal_gamma: float,
     label_smoothing: float,
 ) -> torch.Tensor:
     if focal_gamma <= 0:
-        return F.cross_entropy(logits, targets, weight=class_weights, label_smoothing=label_smoothing)
+        return F.cross_entropy(
+            logits,
+            targets,
+            weight=class_weights,
+            label_smoothing=label_smoothing,
+        )
     log_probs = F.log_softmax(logits, dim=-1)
     probs = torch.exp(log_probs)
     ce_loss = F.nll_loss(log_probs, targets, weight=class_weights, reduction="none")
@@ -62,7 +82,7 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    class_weights: torch.Tensor,
+    class_weights: Optional[torch.Tensor],
     log_interval: int,
     focal_gamma: float,
     label_smoothing: float,
@@ -141,11 +161,20 @@ def main() -> None:
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--focal-gamma", type=float, default=1.5)
     parser.add_argument("--scheduler", type=str, choices=["none", "cosine", "plateau"], default="cosine")
+    parser.add_argument("--sampler", type=str, choices=["none", "balanced"], default="balanced")
+    parser.add_argument("--pooling", type=str, choices=["mean", "max", "sum", "meanmax", "attn"], default="attn")
+    parser.add_argument("--edge-dropout", type=float, default=0.1)
+    parser.add_argument("--use-class-weights", action="store_true")
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, val_loader = build_loaders(args.data_root, args.batch_size, args.num_workers)
+    train_loader, val_loader = build_loaders(
+        args.data_root,
+        args.batch_size,
+        args.num_workers,
+        args.sampler,
+    )
     print(
         f"Loaded {len(train_loader.dataset)} train samples and {len(val_loader.dataset)} val samples.",
         flush=True,
@@ -160,12 +189,13 @@ def main() -> None:
         use_layernorm=True,
         use_residual=True,
         jk_mode="cat",
+        edge_dropout=args.edge_dropout,
     )
     model = GraphClassifier(
         encoder=encoder,
         hidden_channels=args.hidden_channels,
         encoder_out_channels=encoder.out_channels,
-        pooling="meanmax",
+        pooling=args.pooling,
         dropout=args.dropout,
     ).to(device)
 
@@ -176,7 +206,7 @@ def main() -> None:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     else:
         scheduler = None
-    class_weights = compute_class_weights(train_loader, device)
+    class_weights = compute_class_weights(train_loader, device) if args.use_class_weights else None
 
     run_dir = make_run_dir(args.output_dir, args.run_name)
     best_metric = -1.0
