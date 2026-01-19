@@ -40,6 +40,23 @@ def build_loaders(
     return train_loader, val_loader
 
 
+def compute_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    class_weights: torch.Tensor,
+    focal_gamma: float,
+    label_smoothing: float,
+) -> torch.Tensor:
+    if focal_gamma <= 0:
+        return F.cross_entropy(logits, targets, weight=class_weights, label_smoothing=label_smoothing)
+    log_probs = F.log_softmax(logits, dim=-1)
+    probs = torch.exp(log_probs)
+    ce_loss = F.nll_loss(log_probs, targets, weight=class_weights, reduction="none")
+    pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+    focal_term = (1 - pt).pow(focal_gamma)
+    return (focal_term * ce_loss).mean()
+
+
 def train_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -47,6 +64,8 @@ def train_epoch(
     device: torch.device,
     class_weights: torch.Tensor,
     log_interval: int,
+    focal_gamma: float,
+    label_smoothing: float,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -55,7 +74,7 @@ def train_epoch(
         batch = batch.to(device)
         optimizer.zero_grad()
         logits = model(batch)
-        loss = F.cross_entropy(logits, batch.y, weight=class_weights)
+        loss = compute_loss(logits, batch.y, class_weights, focal_gamma, label_smoothing)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
@@ -119,6 +138,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--focal-gamma", type=float, default=1.5)
+    parser.add_argument("--scheduler", type=str, choices=["none", "cosine", "plateau"], default="cosine")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -135,15 +157,25 @@ def main() -> None:
         num_relations=4,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        use_layernorm=True,
+        use_residual=True,
+        jk_mode="cat",
     )
     model = GraphClassifier(
         encoder=encoder,
         hidden_channels=args.hidden_channels,
+        encoder_out_channels=encoder.out_channels,
         pooling="meanmax",
         dropout=args.dropout,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    elif args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    else:
+        scheduler = None
     class_weights = compute_class_weights(train_loader, device)
 
     run_dir = make_run_dir(args.output_dir, args.run_name)
@@ -160,6 +192,8 @@ def main() -> None:
             device,
             class_weights,
             args.log_interval,
+            args.focal_gamma,
+            args.label_smoothing,
         )
         val_loss, metrics = evaluate(model, val_loader, device)
         print(
@@ -188,6 +222,11 @@ def main() -> None:
             patience_counter += 1
             if patience_counter >= args.patience:
                 break
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
 
     if best_state:
         torch.save(best_state, os.path.join(run_dir, "best_model.pt"))

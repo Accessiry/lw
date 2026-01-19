@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 from torch import nn
@@ -10,6 +10,7 @@ class GraphClassifier(nn.Module):
         self,
         encoder: nn.Module,
         hidden_channels: int,
+        encoder_out_channels: Optional[int] = None,
         num_classes: int = 2,
         pooling: Literal["mean", "max", "sum", "meanmax"] = "meanmax",
         dropout: float = 0.2,
@@ -18,9 +19,10 @@ class GraphClassifier(nn.Module):
         self.encoder = encoder
         self.pooling = pooling
         self.dropout = nn.Dropout(dropout)
-        pooled_dim = hidden_channels
+        base_channels = encoder_out_channels or hidden_channels
+        pooled_dim = base_channels
         if pooling == "meanmax":
-            pooled_dim = hidden_channels * 2
+            pooled_dim = base_channels * 2
         self.classifier = nn.Sequential(
             nn.Linear(pooled_dim, hidden_channels),
             nn.ReLU(),

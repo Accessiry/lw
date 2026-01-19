@@ -27,3 +27,15 @@ Each run saves metrics per epoch and the best checkpoint into a timestamped dire
 If the script appears to hang without output, try setting `--num-workers 0` and keep the default
 `--log-interval` so you can see per-step progress logs. Some environments can stall on multi-process
 data loading; reducing workers to zero avoids that issue.
+
+## Performance tuning
+
+If the baseline metrics are low, try enabling focal loss and cosine learning rate decay:
+
+```bash
+python train_file.py \
+  --data-root /home/user/mzaj/datasets/functions_npz_slow \
+  --run-name function_rgat_tuned \
+  --focal-gamma 1.5 \
+  --scheduler cosine
+```
