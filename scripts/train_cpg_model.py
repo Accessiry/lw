@@ -26,12 +26,25 @@ class CPGJsonDataset(Dataset):
         return self.entries[index]
 
 
-def build_graph(entry: Dict[str, object], relation_map: Dict[str, int]) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+def build_graph(
+    entry: Dict[str, object],
+    relation_map: Dict[str, int],
+) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
     nodes = entry["nodes"]
     edges = entry["edges"]
     node_texts = [node.get("code", "") for node in nodes]
-    edge_index = torch.tensor([[edge[0] for edge in edges], [edge[1] for edge in edges]], dtype=torch.long)
-    edge_types = torch.tensor([relation_map[edge[2]] for edge in edges], dtype=torch.long)
+
+    filtered_edges = [edge for edge in edges if edge[2] in relation_map]
+    if not filtered_edges:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_types = torch.zeros((0,), dtype=torch.long)
+        return node_texts, edge_index, edge_types
+
+    edge_index = torch.tensor(
+        [[edge[0] for edge in filtered_edges], [edge[1] for edge in filtered_edges]],
+        dtype=torch.long,
+    )
+    edge_types = torch.tensor([relation_map[edge[2]] for edge in filtered_edges], dtype=torch.long)
     return node_texts, edge_index, edge_types
 
 
@@ -115,7 +128,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--relations",
         nargs="+",
-        default=["AST", "CFG", "CDG", "DDG"],
+        default=["AST", "CFG", "CDG", "DDG", "DOMINATE", "POST_DOMINATE", "REF"],
         help="Relation types to weight (must match JSONL edge type labels)",
     )
     args = parser.parse_args()

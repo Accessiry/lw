@@ -3,7 +3,7 @@
 This repo provides two starter baselines for C vulnerability classification:
 
 1. A **CodeBERT** text classifier trained on raw C files (`vul` vs `novul`).
-2. A **CPG + relation-weighted GNN** classifier that uses Joern to extract CPG JSON, encodes node contents with CodeBERT, and learns relation weights.
+2. A **CPG + relation-weighted GNN** classifier that uses Joern to extract CPG graphson, converts it into JSONL graphs, encodes node contents with CodeBERT, and learns relation weights.
 
 ## Expected dataset layout
 
@@ -30,26 +30,26 @@ python scripts/train_codebert_baseline.py \
 
 ## Baseline 2: Joern + CPG + relation-weighted GNN
 
-### 1) Extract CPG JSON
+### 1) Extract CPG graphson and convert to JSONL
 
 ```bash
 python scripts/extract_cpg_json.py \
   --joern-home /home/user/mzaj/joern-cli \
   --input-dir /home/user/mzaj/datasets/FFMpegQemu/code \
-  --output-dir /home/user/mzaj/FCG/outputs/cpg
+  --output-jsonl /home/user/mzaj/FCG/outputs/cpg/cpg.jsonl \
+  --tmp-root /tmp/joern_cpg
 ```
 
-This produces a JSON export from Joern. Convert it into a JSONL file where each line has:
+The JSONL format contains one graph per C file:
 
 ```json
 {
-  "nodes": [{"id": 1, "code": "..."}],
-  "edges": [[0, 1, "AST"], [1, 2, "CFG"]],
-  "label": 0
+  "path": "/home/user/mzaj/datasets/FFMpegQemu/code/vul/sample.c",
+  "label": 1,
+  "nodes": [{"id": 1, "code": "...", "label": "CALL"}],
+  "edges": [[0, 1, "AST"], [1, 2, "CFG"]]
 }
 ```
-
-You can write a small converter once you decide the schema you want.
 
 ### 2) Train the CPG classifier
 
@@ -62,5 +62,5 @@ python scripts/train_cpg_model.py \
 
 ## Notes
 
-- The CPG model learns **relation weights** (AST/CFG/CDG/DDG by default) and can be extended later with deeper GNN layers or graph pooling.
-- `scripts/train_cpg_model.py` assumes a JSONL graph format. Adjust `build_graph()` as needed to match your final Joern export schema.
+- The CPG model learns **relation weights** (AST/CFG/CDG/DDG/DOMINATE/POST_DOMINATE/REF by default) and can be extended later with deeper GNN layers or graph pooling.
+- If Joern outputs additional relations, add them via `--relations` when training.
