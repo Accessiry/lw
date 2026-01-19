@@ -1,0 +1,16 @@
+# Example configuration for function-level NPZ training
+# Usage: python train_file.py --data-root /path/to/functions_npz_slow
+
+data_root: /home/user/mzaj/datasets/functions_npz_slow
+output_dir: runs
+run_name: function_rgat
+epochs: 60
+batch_size: 16
+hidden_channels: 256
+num_layers: 3
+dropout: 0.2
+lr: 0.0002
+weight_decay: 0.0001
+num_workers: 4
+seed: 42
+patience: 8
