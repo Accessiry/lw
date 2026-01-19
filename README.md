@@ -21,3 +21,9 @@ Each run saves metrics per epoch and the best checkpoint into a timestamped dire
 - `metrics_epoch_*.json`: per-epoch loss and metrics
 - `best_model.pt`: best checkpoint by average of F1 and MCC
 - `summary.json`: configuration and best score
+
+## Troubleshooting
+
+If the script appears to hang without output, try setting `--num-workers 0` and keep the default
+`--log-interval` so you can see per-step progress logs. Some environments can stall on multi-process
+data loading; reducing workers to zero avoids that issue.

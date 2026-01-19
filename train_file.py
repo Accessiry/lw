@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 from dataclasses import asdict
 from typing import Dict, Tuple
 
@@ -45,10 +46,12 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     class_weights: torch.Tensor,
+    log_interval: int,
 ) -> float:
     model.train()
     total_loss = 0.0
-    for batch in loader:
+    start_time = time.time()
+    for step, batch in enumerate(loader, start=1):
         batch = batch.to(device)
         optimizer.zero_grad()
         logits = model(batch)
@@ -57,6 +60,13 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         total_loss += loss.item() * batch.num_graphs
+        if log_interval > 0 and step % log_interval == 0:
+            elapsed = time.time() - start_time
+            print(
+                f"  [train] step {step}/{len(loader)} "
+                f"loss={loss.item():.4f} elapsed={elapsed:.1f}s",
+                flush=True,
+            )
     return total_loss / len(loader.dataset)
 
 
@@ -105,14 +115,19 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--log-interval", type=int, default=50)
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, val_loader = build_loaders(args.data_root, args.batch_size, args.num_workers)
+    print(
+        f"Loaded {len(train_loader.dataset)} train samples and {len(val_loader.dataset)} val samples.",
+        flush=True,
+    )
 
     encoder = RGATEncoder(
         in_channels=768,
@@ -137,8 +152,28 @@ def main() -> None:
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, device, class_weights)
+        print(f"Epoch {epoch}/{args.epochs}", flush=True)
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            class_weights,
+            args.log_interval,
+        )
         val_loss, metrics = evaluate(model, val_loader, device)
+        print(
+            "  [val] loss={:.4f} acc={:.4f} precision={:.4f} recall={:.4f} "
+            "f1={:.4f} mcc={:.4f}".format(
+                val_loss,
+                metrics.accuracy,
+                metrics.precision,
+                metrics.recall,
+                metrics.f1,
+                metrics.mcc,
+            ),
+            flush=True,
+        )
 
         metrics_payload = asdict(metrics)
         metrics_payload.update({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
