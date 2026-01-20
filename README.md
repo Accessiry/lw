@@ -53,6 +53,8 @@ The JSONL format contains one graph per C file:
 }
 ```
 
+For a quick smoke test on a few files, add `--limit 5`. To speed up extraction, increase `--workers` (each worker runs its own Joern process).
+
 ### 2) Train the CPG classifier
 
 ```bash

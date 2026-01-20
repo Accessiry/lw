@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -14,7 +15,7 @@ def run(command: List[str], cwd: Path | None = None) -> None:
 
 
 def iter_c_files(root: Path) -> Iterable[Path]:
-    for path in root.rglob("*.c"):
+    for path in sorted(root.rglob("*.c")):
         if path.is_file():
             yield path
 
@@ -53,9 +54,36 @@ def extract_graphson(
     return export_json
 
 
+def _graphson_value(value: object) -> object:
+    if isinstance(value, dict) and "@value" in value:
+        return value["@value"]
+    return value
+
+
+def _graphson_map(value: object) -> Dict[str, object]:
+    value = _graphson_value(value)
+    if isinstance(value, list):
+        mapped: Dict[str, object] = {}
+        for i in range(0, len(value), 2):
+            if i + 1 < len(value):
+                mapped[str(value[i])] = value[i + 1]
+        return mapped
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _graphson_list(value: object) -> List[object]:
+    value = _graphson_value(value)
+    if isinstance(value, list):
+        return value
+    return []
+
+
 def _normalize_props(props: Dict[str, object]) -> Dict[str, object]:
     normalized: Dict[str, object] = {}
-    for key, value in (props or {}).items():
+    for key, value in _graphson_map(props).items():
+        value = _graphson_value(value)
         if isinstance(value, list) and value:
             first = value[0]
             if isinstance(first, dict) and "value" in first:
@@ -69,16 +97,17 @@ def _normalize_props(props: Dict[str, object]) -> Dict[str, object]:
 
 def parse_graphson(export_json: Path) -> Tuple[List[Dict[str, object]], List[Tuple[int, int, str]]]:
     data = json.loads(export_json.read_text(encoding="utf-8"))
-    graph = data.get("graph", data)
-    vertices = graph.get("vertices", [])
-    edges = graph.get("edges", [])
+    graph = _graphson_map(_graphson_value(data))
+    vertices = _graphson_list(graph.get("vertices", []))
+    edges = _graphson_list(graph.get("edges", []))
 
     nodes: List[Dict[str, object]] = []
     id_to_index: Dict[object, int] = {}
 
     for idx, node in enumerate(vertices):
-        node_id = node.get("id")
-        label = node.get("label", "UNKNOWN")
+        node = _graphson_map(node)
+        node_id = _graphson_value(node.get("id"))
+        label = _graphson_value(node.get("label", "UNKNOWN"))
         props = _normalize_props(node.get("properties", {}) if isinstance(node, dict) else {})
         code = props.get("CODE") or props.get("code") or label
         nodes.append({"id": node_id, "code": code, "label": label})
@@ -86,9 +115,10 @@ def parse_graphson(export_json: Path) -> Tuple[List[Dict[str, object]], List[Tup
 
     edge_list: List[Tuple[int, int, str]] = []
     for edge in edges:
-        src = edge.get("outV")
-        dst = edge.get("inV")
-        rel = edge.get("label", "UNKNOWN")
+        edge = _graphson_map(edge)
+        src = _graphson_value(edge.get("outV"))
+        dst = _graphson_value(edge.get("inV"))
+        rel = _graphson_value(edge.get("label", "UNKNOWN"))
         if src not in id_to_index or dst not in id_to_index:
             continue
         edge_list.append((id_to_index[src], id_to_index[dst], rel))
@@ -109,6 +139,20 @@ def build_jsonl_entry(
     }
 
 
+def _process_file(
+    c_file: Path,
+    joern_parse: Path,
+    joern_export: Path,
+    tmp_root: Path,
+    index: int,
+) -> Dict[str, object] | None:
+    tmp_dir = tmp_root / f"joern_{index}"
+    export_json = extract_graphson(c_file, joern_parse, joern_export, tmp_dir)
+    entry = build_jsonl_entry(c_file, export_json)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return entry
+
+
 def extract_dataset(args: argparse.Namespace) -> None:
     joern_home = Path(args.joern_home)
     joern_parse = joern_home / "joern-parse"
@@ -125,13 +169,28 @@ def extract_dataset(args: argparse.Namespace) -> None:
     tmp_root.mkdir(parents=True, exist_ok=True)
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
+    c_files = list(iter_c_files(input_dir))
+    if args.limit:
+        c_files = c_files[: args.limit]
+
     with output_jsonl.open("w", encoding="utf-8") as handle:
-        for idx, c_file in enumerate(iter_c_files(input_dir)):
-            tmp_dir = tmp_root / f"joern_{idx}"
-            export_json = extract_graphson(c_file, joern_parse, joern_export, tmp_dir)
-            entry = build_jsonl_entry(c_file, export_json)
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if args.workers <= 1:
+            for idx, c_file in enumerate(c_files):
+                entry = _process_file(c_file, joern_parse, joern_export, tmp_root, idx)
+                if entry is None:
+                    continue
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        else:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(_process_file, c_file, joern_parse, joern_export, tmp_root, idx): c_file
+                    for idx, c_file in enumerate(c_files)
+                }
+                for future in as_completed(futures):
+                    entry = future.result()
+                    if entry is None:
+                        continue
+                    handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
@@ -140,4 +199,6 @@ if __name__ == "__main__":
     parser.add_argument("--input-dir", required=True)
     parser.add_argument("--output-jsonl", required=True)
     parser.add_argument("--tmp-root", default="/tmp/joern_cpg")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of C files for a quick smoke test.")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel workers for Joern extraction.")
     extract_dataset(parser.parse_args())
