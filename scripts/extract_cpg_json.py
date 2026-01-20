@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -175,7 +176,24 @@ def extract_dataset(args: argparse.Namespace) -> None:
     if args.limit:
         c_files = c_files[: args.limit]
 
-    with output_jsonl.open("w", encoding="utf-8") as handle:
+    if args.workers <= 0:
+        args.workers = max(os.cpu_count() or 1, 1)
+
+    processed: set[str] = set()
+    write_mode = "w"
+    if args.resume and output_jsonl.exists():
+        write_mode = "a"
+        with output_jsonl.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    processed.add(json.loads(line).get("path", ""))
+                except json.JSONDecodeError:
+                    continue
+        c_files = [path for path in c_files if str(path) not in processed]
+
+    with output_jsonl.open(write_mode, encoding="utf-8") as handle:
         if args.workers <= 1:
             for idx, c_file in enumerate(c_files):
                 entry = _process_file(c_file, joern_parse, joern_export, tmp_root, idx)
@@ -184,12 +202,16 @@ def extract_dataset(args: argparse.Namespace) -> None:
                 handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
         else:
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                futures = {
-                    executor.submit(_process_file, c_file, joern_parse, joern_export, tmp_root, idx): c_file
-                    for idx, c_file in enumerate(c_files)
-                }
-                for future in as_completed(futures):
-                    entry = future.result()
+                entries = executor.map(
+                    _process_file,
+                    c_files,
+                    [joern_parse] * len(c_files),
+                    [joern_export] * len(c_files),
+                    [tmp_root] * len(c_files),
+                    list(range(len(c_files))),
+                    chunksize=max(args.chunksize, 1),
+                )
+                for entry in entries:
                     if entry is None:
                         continue
                     handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -202,5 +224,21 @@ if __name__ == "__main__":
     parser.add_argument("--output-jsonl", required=True)
     parser.add_argument("--tmp-root", default="/tmp/joern_cpg")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of C files for a quick smoke test.")
-    parser.add_argument("--workers", type=int, default=1, help="Parallel workers for Joern extraction.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel workers for Joern extraction (<=0 uses CPU count).",
+    )
+    parser.add_argument(
+        "--chunksize",
+        type=int,
+        default=1,
+        help="Chunk size for parallel extraction scheduling.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append to an existing JSONL and skip already processed paths.",
+    )
     extract_dataset(parser.parse_args())
