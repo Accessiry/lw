@@ -98,6 +98,8 @@ def _normalize_props(props: Dict[str, object]) -> Dict[str, object]:
 def parse_graphson(export_json: Path) -> Tuple[List[Dict[str, object]], List[Tuple[int, int, str]]]:
     data = json.loads(export_json.read_text(encoding="utf-8"))
     graph = _graphson_map(_graphson_value(data))
+    if isinstance(graph, dict) and "graph" in graph:
+        graph = _graphson_map(graph["graph"])
     vertices = _graphson_list(graph.get("vertices", []))
     edges = _graphson_list(graph.get("edges", []))
 
