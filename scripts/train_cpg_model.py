@@ -74,6 +74,8 @@ def collate_batch(tokenizer, relation_map, batch):
     labels = []
     for entry in batch:
         node_texts, edge_index, edge_types = build_graph(entry, relation_map)
+        if not node_texts:
+            node_texts = [entry.get("path", "<empty>")]
         tokens = tokenizer(
             node_texts,
             padding=True,
