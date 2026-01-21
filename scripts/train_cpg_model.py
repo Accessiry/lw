@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -50,37 +51,51 @@ def split_entries(
 def build_graph(
     entry: Dict[str, object],
     relation_map: Dict[str, int],
+    max_nodes: int,
 ) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
     nodes = entry["nodes"]
     edges = entry["edges"]
-    node_texts = [node.get("code", "") for node in nodes]
+    total_nodes = len(nodes)
+    keep_indices = list(range(total_nodes))
 
-    filtered_edges = [edge for edge in edges if edge[2] in relation_map]
+    if max_nodes > 0 and total_nodes > max_nodes:
+        seed = entry.get("path", "")
+        rng = random.Random(seed)
+        keep_indices = sorted(rng.sample(keep_indices, max_nodes))
+
+    index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(keep_indices)}
+    node_texts = [nodes[idx].get("code", "") for idx in keep_indices]
+
+    filtered_edges = [
+        edge
+        for edge in edges
+        if edge[2] in relation_map and edge[0] in index_map and edge[1] in index_map
+    ]
     if not filtered_edges:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         edge_types = torch.zeros((0,), dtype=torch.long)
         return node_texts, edge_index, edge_types
 
     edge_index = torch.tensor(
-        [[edge[0] for edge in filtered_edges], [edge[1] for edge in filtered_edges]],
+        [[index_map[edge[0]] for edge in filtered_edges], [index_map[edge[1]] for edge in filtered_edges]],
         dtype=torch.long,
     )
     edge_types = torch.tensor([relation_map[edge[2]] for edge in filtered_edges], dtype=torch.long)
     return node_texts, edge_index, edge_types
 
 
-def collate_batch(tokenizer, relation_map, batch):
+def collate_batch(tokenizer, relation_map, max_nodes: int, max_length: int, batch):
     graphs = []
     labels = []
     for entry in batch:
-        node_texts, edge_index, edge_types = build_graph(entry, relation_map)
+        node_texts, edge_index, edge_types = build_graph(entry, relation_map, max_nodes)
         if not node_texts:
             node_texts = [entry.get("path", "<empty>")]
         tokens = tokenizer(
             node_texts,
             padding=True,
             truncation=True,
-            max_length=64,
+            max_length=max_length,
             return_tensors="pt",
         )
         graphs.append((tokens, edge_index, edge_types))
@@ -107,12 +122,14 @@ def evaluate(
     encoder: AutoModel,
     dataloader: DataLoader,
     device: torch.device,
+    use_fp16: bool,
 ) -> dict:
     classifier.eval()
     encoder.eval()
     all_logits = []
     all_labels = []
-    with torch.no_grad():
+    autocast = torch.cuda.amp.autocast if use_fp16 and device.type == "cuda" else nullcontext
+    with torch.no_grad(), autocast():
         for graphs, labels in dataloader:
             labels = labels.to(device)
             logits_list = []
@@ -149,19 +166,37 @@ def train(args: argparse.Namespace) -> None:
         CPGJsonDataset(train_entries),
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda batch: collate_batch(args.tokenizer, relation_map, batch),
+        collate_fn=lambda batch: collate_batch(
+            args.tokenizer,
+            relation_map,
+            args.max_nodes,
+            args.max_length,
+            batch,
+        ),
     )
     val_loader = DataLoader(
         CPGJsonDataset(val_entries),
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=lambda batch: collate_batch(args.tokenizer, relation_map, batch),
+        collate_fn=lambda batch: collate_batch(
+            args.tokenizer,
+            relation_map,
+            args.max_nodes,
+            args.max_length,
+            batch,
+        ),
     )
     test_loader = DataLoader(
         CPGJsonDataset(test_entries),
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=lambda batch: collate_batch(args.tokenizer, relation_map, batch),
+        collate_fn=lambda batch: collate_batch(
+            args.tokenizer,
+            relation_map,
+            args.max_nodes,
+            args.max_length,
+            batch,
+        ),
     )
 
     encoder = AutoModel.from_pretrained(args.model_path)
@@ -177,12 +212,13 @@ def train(args: argparse.Namespace) -> None:
     classifier.train()
     for epoch in range(args.epochs):
         total_loss = 0.0
+        autocast = torch.cuda.amp.autocast if args.fp16 and device.type == "cuda" else nullcontext
         for graphs, labels in train_loader:
             labels = labels.to(device)
             logits_list = []
             for tokens, edge_index, edge_types in graphs:
                 tokens = {k: v.to(device) for k, v in tokens.items()}
-                with torch.no_grad():
+                with torch.no_grad(), autocast():
                     node_embeddings = encoder(**tokens).last_hidden_state[:, 0, :]
                 graph = CPGGraph(
                     node_embeddings=node_embeddings,
@@ -197,7 +233,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer.step()
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
-        val_metrics = evaluate(classifier, encoder, val_loader, device)
+        val_metrics = evaluate(classifier, encoder, val_loader, device, args.fp16)
         print(
             "epoch={epoch} loss={loss:.4f} val_acc={acc:.4f} val_f1={f1:.4f}"
             " val_precision={precision:.4f} val_recall={recall:.4f}".format(
@@ -208,7 +244,7 @@ def train(args: argparse.Namespace) -> None:
         )
         classifier.train()
 
-    test_metrics = evaluate(classifier, encoder, test_loader, device)
+    test_metrics = evaluate(classifier, encoder, test_loader, device, args.fp16)
     print(
         "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}".format(
             **test_metrics
@@ -230,6 +266,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max-length", type=int, default=64, help="Max token length per node text.")
+    parser.add_argument("--max-nodes", type=int, default=256, help="Max nodes per graph (0 disables).")
+    parser.add_argument("--fp16", action="store_true", help="Enable fp16 autocast for the encoder.")
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)

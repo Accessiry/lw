@@ -66,6 +66,7 @@ python scripts/train_cpg_model.py \
 ```
 
 This also uses a default 80/10/10 train/val/test split with `--train-ratio`, `--val-ratio`, and `--seed` available.
+If you hit GPU OOM, reduce `--batch-size`, lower `--max-length`, cap nodes per graph with `--max-nodes`, or enable `--fp16`.
 
 ## Notes
 
