@@ -10,6 +10,7 @@ from statistics import mean
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModel, AutoTokenizer
 
@@ -105,7 +106,8 @@ def build_graph(
     entry: Dict[str, object],
     relation_map: Dict[str, int],
     max_nodes: int,
-) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[int]]:
+    node_type_map: Dict[str, int],
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[int], torch.Tensor]:
     nodes = entry["nodes"]
     edges = entry["edges"]
     total_nodes = len(nodes)
@@ -118,6 +120,10 @@ def build_graph(
 
     index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(keep_indices)}
     node_texts = [nodes[idx].get("code", "") for idx in keep_indices]
+    node_type_ids = torch.tensor(
+        [node_type_map.get(nodes[idx].get("label", ""), 0) for idx in keep_indices],
+        dtype=torch.long,
+    )
 
     filtered_edges = [
         edge
@@ -127,14 +133,14 @@ def build_graph(
     if not filtered_edges:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         edge_types = torch.zeros((0,), dtype=torch.long)
-        return node_texts, edge_index, edge_types, keep_indices
+        return node_texts, edge_index, edge_types, keep_indices, node_type_ids
 
     edge_index = torch.tensor(
         [[index_map[edge[0]] for edge in filtered_edges], [index_map[edge[1]] for edge in filtered_edges]],
         dtype=torch.long,
     )
     edge_types = torch.tensor([relation_map[edge[2]] for edge in filtered_edges], dtype=torch.long)
-    return node_texts, edge_index, edge_types, keep_indices
+    return node_texts, edge_index, edge_types, keep_indices, node_type_ids
 
 
 def load_cached_embeddings(entry: Dict[str, object], cache_dir: Path, cache_index: Dict[str, str]) -> torch.Tensor:
@@ -153,16 +159,30 @@ def load_cached_embeddings(entry: Dict[str, object], cache_dir: Path, cache_inde
     raise ValueError(f"Unsupported cache format at {cache_path}")
 
 
-def collate_batch(tokenizer, relation_map, max_nodes: int, max_length: int, batch, cache_dir, cache_index):
+def collate_batch(
+    tokenizer,
+    relation_map,
+    max_nodes: int,
+    max_length: int,
+    batch,
+    cache_dir,
+    cache_index,
+    node_type_map,
+):
     graphs = []
     labels = []
     for entry in batch:
-        node_texts, edge_index, edge_types, keep_indices = build_graph(entry, relation_map, max_nodes)
+        node_texts, edge_index, edge_types, keep_indices, node_type_ids = build_graph(
+            entry,
+            relation_map,
+            max_nodes,
+            node_type_map,
+        )
         if cache_dir:
             embeddings = load_cached_embeddings(entry, cache_dir, cache_index)
             if keep_indices:
                 embeddings = embeddings[keep_indices]
-            graphs.append((embeddings, edge_index, edge_types))
+            graphs.append((embeddings, edge_index, edge_types, node_type_ids))
         else:
             if not node_texts:
                 node_texts = [entry.get("path", "<empty>")]
@@ -173,7 +193,7 @@ def collate_batch(tokenizer, relation_map, max_nodes: int, max_length: int, batc
                 max_length=max_length,
                 return_tensors="pt",
             )
-            graphs.append((tokens, edge_index, edge_types))
+            graphs.append((tokens, edge_index, edge_types, node_type_ids))
         labels.append(entry.get("label", 0))
     return graphs, torch.tensor(labels, dtype=torch.long)
 
@@ -209,7 +229,7 @@ def evaluate(
         for graphs, labels in dataloader:
             labels = labels.to(device)
             logits_list = []
-            for node_inputs, edge_index, edge_types in graphs:
+            for node_inputs, edge_index, edge_types, node_type_ids in graphs:
                 if cache_dir:
                     node_embeddings = node_inputs.to(device)
                 else:
@@ -219,6 +239,7 @@ def evaluate(
                     node_embeddings=node_embeddings,
                     edge_index=edge_index.to(device),
                     edge_types=edge_types.to(device),
+                    node_type_ids=node_type_ids.to(device),
                 )
                 logits_list.append(classifier(graph))
             logits = torch.stack(logits_list)
@@ -231,9 +252,36 @@ def evaluate(
     return compute_metrics(logits, labels)
 
 
+def build_type_mapping(entries: List[Dict[str, object]]) -> Dict[str, int]:
+    labels = set()
+    for entry in entries:
+        for node in entry.get("nodes", []):
+            label = node.get("label")
+            if label:
+                labels.add(label)
+    mapping = {"<UNK>": 0}
+    for label in sorted(labels):
+        mapping[label] = len(mapping)
+    return mapping
+
+
+def focal_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    class_weights: torch.Tensor | None,
+    gamma: float,
+) -> torch.Tensor:
+    log_probs = F.log_softmax(logits, dim=-1)
+    ce = F.nll_loss(log_probs, labels, weight=class_weights, reduction="none")
+    pt = torch.exp(-ce)
+    loss = (1 - pt) ** gamma * ce
+    return loss.mean()
+
+
 def train(args: argparse.Namespace) -> None:
     relation_map = {name: idx for idx, name in enumerate(args.relations)}
     entries = load_entries(Path(args.cpg_jsonl))
+    node_type_map = build_type_mapping(entries)
     train_entries, val_entries, test_entries = split_entries(
         entries,
         train_ratio=args.train_ratio,
@@ -265,6 +313,7 @@ def train(args: argparse.Namespace) -> None:
             batch,
             cache_dir,
             cache_index,
+            node_type_map,
         ),
     )
     val_loader = DataLoader(
@@ -279,6 +328,7 @@ def train(args: argparse.Namespace) -> None:
             batch,
             cache_dir,
             cache_index,
+            node_type_map,
         ),
     )
     test_loader = DataLoader(
@@ -293,6 +343,7 @@ def train(args: argparse.Namespace) -> None:
             batch,
             cache_dir,
             cache_index,
+            node_type_map,
         ),
     )
 
@@ -303,6 +354,9 @@ def train(args: argparse.Namespace) -> None:
         relation_count=len(relation_map),
         num_layers=args.gnn_layers,
         dropout=args.dropout,
+        node_type_count=len(node_type_map),
+        type_embed_dim=args.type_embed_dim,
+        pooling=args.pooling,
     )
     classifier.to(device)
     encoder.to(device)
@@ -319,7 +373,7 @@ def train(args: argparse.Namespace) -> None:
     class_weights = None
     if args.class_weight == "auto":
         class_weights = build_class_weights(train_entries).to(device)
-    loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
+    loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
 
     classifier.train()
     best_val_f1 = -1.0
@@ -334,7 +388,7 @@ def train(args: argparse.Namespace) -> None:
         for graphs, labels in train_loader:
             labels = labels.to(device)
             logits_list = []
-            for node_inputs, edge_index, edge_types in graphs:
+            for node_inputs, edge_index, edge_types, node_type_ids in graphs:
                 if cache_dir:
                     node_embeddings = node_inputs.to(device)
                 else:
@@ -345,12 +399,18 @@ def train(args: argparse.Namespace) -> None:
                     node_embeddings=node_embeddings,
                     edge_index=edge_index.to(device),
                     edge_types=edge_types.to(device),
+                    node_type_ids=node_type_ids.to(device),
                 )
                 logits_list.append(classifier(graph))
             logits = torch.stack(logits_list)
-            loss = loss_fn(logits, labels)
+            if args.focal_gamma > 0:
+                loss = focal_loss(logits, labels, class_weights, args.focal_gamma)
+            else:
+                loss = loss_fn(logits, labels)
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(classifier.parameters(), args.grad_clip)
             optimizer.step()
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
@@ -377,7 +437,7 @@ def train(args: argparse.Namespace) -> None:
         classifier.train()
 
     if best_path.exists():
-        classifier.load_state_dict(torch.load(best_path, map_location=device))
+        classifier.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
     test_metrics = evaluate(classifier, encoder, test_loader, device, args.fp16, cache_dir)
     print(
         "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}".format(
@@ -401,9 +461,14 @@ if __name__ == "__main__":
     parser.add_argument("--early-stop-patience", type=int, default=3, help="Stop if val_f1 stops improving.")
     parser.add_argument("--gnn-layers", type=int, default=2, help="Number of GNN layers.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout for GNN and classifier.")
+    parser.add_argument("--pooling", choices=["mean", "max", "mean_max", "attention"], default="mean_max")
+    parser.add_argument("--type-embed-dim", type=int, default=64, help="Node type embedding size.")
     parser.add_argument("--max-length", type=int, default=64, help="Max token length per node text.")
     parser.add_argument("--max-nodes", type=int, default=256, help="Max nodes per graph (0 disables).")
     parser.add_argument("--fp16", action="store_true", help="Enable fp16 autocast for the encoder.")
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for CE loss.")
+    parser.add_argument("--focal-gamma", type=float, default=0.0, help="Use focal loss when > 0.")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping (0 to disable).")
     parser.add_argument(
         "--feature-cache",
         default=None,

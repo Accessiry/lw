@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -12,6 +12,7 @@ class CPGGraph:
     node_embeddings: torch.Tensor
     edge_index: torch.Tensor
     edge_types: torch.Tensor
+    node_type_ids: Optional[torch.Tensor] = None
 
 
 class RelationWeightedLayer(nn.Module):
@@ -93,8 +94,19 @@ class CPGClassifier(nn.Module):
         num_classes: int = 2,
         num_layers: int = 2,
         dropout: float = 0.1,
+        node_type_count: int = 0,
+        type_embed_dim: int = 0,
+        pooling: str = "mean_max",
     ):
         super().__init__()
+        self.pooling = pooling
+        self.type_embed_dim = type_embed_dim if node_type_count > 0 else 0
+        if self.type_embed_dim > 0:
+            self.type_embedding = nn.Embedding(node_type_count, self.type_embed_dim)
+            self.input_proj = nn.Linear(hidden_size + self.type_embed_dim, hidden_size)
+        else:
+            self.type_embedding = None
+            self.input_proj = None
         self.encoder = RelationWeightedEncoder(
             hidden_size=hidden_size,
             relation_count=relation_count,
@@ -102,18 +114,50 @@ class CPGClassifier(nn.Module):
             dropout=dropout,
         )
         self.dropout = nn.Dropout(dropout)
+        if self.pooling == "attention":
+            self.attn = nn.Linear(hidden_size, 1)
+            pooled_dim = hidden_size
+        elif self.pooling == "mean":
+            self.attn = None
+            pooled_dim = hidden_size
+        elif self.pooling == "max":
+            self.attn = None
+            pooled_dim = hidden_size
+        else:
+            self.attn = None
+            pooled_dim = hidden_size * 2
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Linear(pooled_dim, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, num_classes),
         )
 
     def forward(self, graph: CPGGraph) -> torch.Tensor:
+        node_repr = graph.node_embeddings
+        if self.type_embedding is not None and graph.node_type_ids is not None:
+            type_embeds = self.type_embedding(graph.node_type_ids)
+            node_repr = torch.cat([node_repr, type_embeds], dim=-1)
+            node_repr = self.input_proj(node_repr)
+        graph = CPGGraph(
+            node_embeddings=node_repr,
+            edge_index=graph.edge_index,
+            edge_types=graph.edge_types,
+        )
         node_repr = self.encoder(graph)
-        mean_pool = node_repr.mean(dim=0)
-        max_pool = node_repr.max(dim=0).values
-        graph_repr = self.dropout(torch.cat([mean_pool, max_pool], dim=0))
+        if self.pooling == "attention":
+            attn_scores = self.attn(node_repr).squeeze(-1)
+            attn_weights = torch.softmax(attn_scores, dim=0)
+            graph_repr = (attn_weights.unsqueeze(-1) * node_repr).sum(dim=0)
+        elif self.pooling == "mean":
+            graph_repr = node_repr.mean(dim=0)
+        elif self.pooling == "max":
+            graph_repr = node_repr.max(dim=0).values
+        else:
+            mean_pool = node_repr.mean(dim=0)
+            max_pool = node_repr.max(dim=0).values
+            graph_repr = torch.cat([mean_pool, max_pool], dim=0)
+        graph_repr = self.dropout(graph_repr)
         return self.classifier(graph_repr)
 
 
