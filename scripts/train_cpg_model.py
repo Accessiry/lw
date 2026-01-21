@@ -298,7 +298,12 @@ def train(args: argparse.Namespace) -> None:
 
     encoder = AutoModel.from_pretrained(args.model_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    classifier = CPGClassifier(encoder.config.hidden_size, relation_count=len(relation_map))
+    classifier = CPGClassifier(
+        encoder.config.hidden_size,
+        relation_count=len(relation_map),
+        num_layers=args.gnn_layers,
+        dropout=args.dropout,
+    )
     classifier.to(device)
     encoder.to(device)
     encoder.eval()
@@ -369,6 +374,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gnn-layers", type=int, default=2, help="Number of GNN layers.")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout for GNN and classifier.")
     parser.add_argument("--max-length", type=int, default=64, help="Max token length per node text.")
     parser.add_argument("--max-nodes", type=int, default=256, help="Max nodes per graph (0 disables).")
     parser.add_argument("--fp16", action="store_true", help="Enable fp16 autocast for the encoder.")
