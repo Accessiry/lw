@@ -205,11 +205,34 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict:
     tp = ((preds == 1) & (labels == 1)).sum().item()
     fp = ((preds == 1) & (labels == 0)).sum().item()
     fn = ((preds == 0) & (labels == 1)).sum().item()
+    tn = ((preds == 0) & (labels == 0)).sum().item()
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    precision_neg = tn / (tn + fn) if (tn + fn) else 0.0
+    recall_neg = tn / (tn + fp) if (tn + fp) else 0.0
+    f1_neg = 2 * precision_neg * recall_neg / (precision_neg + recall_neg) if (precision_neg + recall_neg) else 0.0
+    macro_f1 = (f1 + f1_neg) / 2
+    balanced_acc = (recall + recall_neg) / 2
+    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    mcc = ((tp * tn - fp * fn) / denom**0.5) if denom else 0.0
     acc = correct / total if total else 0.0
-    return {"acc": acc, "precision": precision, "recall": recall, "f1": f1}
+    return {
+        "acc": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "precision_neg": precision_neg,
+        "recall_neg": recall_neg,
+        "f1_neg": f1_neg,
+        "macro_f1": macro_f1,
+        "balanced_acc": balanced_acc,
+        "mcc": mcc,
+        "tp": float(tp),
+        "fp": float(fp),
+        "fn": float(fn),
+        "tn": float(tn),
+    }
 
 
 def evaluate(
@@ -377,6 +400,7 @@ def train(args: argparse.Namespace) -> None:
 
     classifier.train()
     best_val_f1 = -1.0
+    best_metrics: dict | None = None
     best_epoch = -1
     epochs_without_improve = 0
     output_dir = Path(args.output_dir)
@@ -418,7 +442,8 @@ def train(args: argparse.Namespace) -> None:
         scheduler.step(val_metrics["f1"])
         print(
             "epoch={epoch} loss={loss:.4f} val_acc={acc:.4f} val_f1={f1:.4f}"
-            " val_precision={precision:.4f} val_recall={recall:.4f}".format(
+            " val_precision={precision:.4f} val_recall={recall:.4f} val_macro_f1={macro_f1:.4f}"
+            " val_balanced_acc={balanced_acc:.4f} val_mcc={mcc:.4f}".format(
                 epoch=epoch + 1,
                 loss=avg_loss,
                 **val_metrics,
@@ -428,6 +453,10 @@ def train(args: argparse.Namespace) -> None:
             best_val_f1 = val_metrics["f1"]
             best_epoch = epoch + 1
             torch.save(classifier.state_dict(), best_path)
+            best_metrics = {
+                "epoch": best_epoch,
+                **val_metrics,
+            }
             epochs_without_improve = 0
         else:
             epochs_without_improve += 1
@@ -440,7 +469,8 @@ def train(args: argparse.Namespace) -> None:
         classifier.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
     test_metrics = evaluate(classifier, encoder, test_loader, device, args.fp16, cache_dir)
     print(
-        "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}".format(
+        "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}"
+        " test_macro_f1={macro_f1:.4f} test_balanced_acc={balanced_acc:.4f} test_mcc={mcc:.4f}".format(
             **test_metrics
         )
     )
@@ -448,6 +478,13 @@ def train(args: argparse.Namespace) -> None:
     classifier_path = output_dir / "cpg_classifier.pt"
     torch.save(classifier.state_dict(), classifier_path)
     print(f"saved: {classifier_path}")
+    if best_metrics:
+        best_metrics_path = output_dir / "cpg_best_metrics.json"
+        best_metrics_path.write_text(json.dumps(best_metrics, indent=2), encoding="utf-8")
+        print(f"saved: {best_metrics_path}")
+    final_metrics_path = output_dir / "cpg_test_metrics.json"
+    final_metrics_path.write_text(json.dumps(test_metrics, indent=2), encoding="utf-8")
+    print(f"saved: {final_metrics_path}")
 
 
 if __name__ == "__main__":

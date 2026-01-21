@@ -69,7 +69,7 @@ This also uses a default 80/10/10 train/val/test split with `--train-ratio`, `--
 If you hit GPU OOM, reduce `--batch-size`, lower `--max-length`, cap nodes per graph with `--max-nodes`, or enable `--fp16`.
 For class imbalance or collapsed predictions, `--class-weight auto` enables inverse-frequency weights, and `--log-graph-stats` prints node/edge summary stats per split.
 You can adjust the graph model capacity with `--gnn-layers`, `--dropout`, and `--pooling`, and use `--early-stop-patience` for early stopping on validation F1.
-For additional stability, try `--label-smoothing`, `--focal-gamma`, and `--grad-clip`, and enable node type embeddings with `--type-embed-dim`.
+For additional stability, try `--label-smoothing`, `--focal-gamma`, and `--grad-clip`, and enable node type embeddings with `--type-embed-dim`. Training now also saves `cpg_best_metrics.json` and `cpg_test_metrics.json` in the output directory.
 
 ### Optional: cache CodeBERT node embeddings for faster training
 
