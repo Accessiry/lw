@@ -198,8 +198,9 @@ def collate_batch(
     return graphs, torch.tensor(labels, dtype=torch.long)
 
 
-def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict:
-    preds = logits.argmax(dim=-1)
+def compute_metrics(logits: torch.Tensor, labels: torch.Tensor, threshold: float = 0.5) -> dict:
+    probs = torch.softmax(logits, dim=-1)
+    preds = (probs[:, 1] >= threshold).long()
     correct = (preds == labels).sum().item()
     total = labels.numel()
     tp = ((preds == 1) & (labels == 1)).sum().item()
@@ -232,6 +233,7 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict:
         "fp": float(fp),
         "fn": float(fn),
         "tn": float(tn),
+        "threshold": threshold,
     }
 
 
@@ -242,6 +244,7 @@ def evaluate(
     device: torch.device,
     use_fp16: bool,
     cache_dir: Path | None,
+    threshold: float,
 ) -> dict:
     classifier.eval()
     encoder.eval()
@@ -272,7 +275,7 @@ def evaluate(
         return {"acc": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
     logits = torch.cat(all_logits, dim=0)
     labels = torch.cat(all_labels, dim=0)
-    return compute_metrics(logits, labels)
+    return compute_metrics(logits, labels, threshold=threshold)
 
 
 def build_type_mapping(entries: List[Dict[str, object]]) -> Dict[str, int]:
@@ -406,6 +409,7 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     best_path = output_dir / "cpg_classifier_best.pt"
+    best_threshold = args.threshold
     for epoch in range(args.epochs):
         total_loss = 0.0
         autocast = torch.cuda.amp.autocast if args.fp16 and device.type == "cuda" else nullcontext
@@ -438,7 +442,42 @@ def train(args: argparse.Namespace) -> None:
             optimizer.step()
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
-        val_metrics = evaluate(classifier, encoder, val_loader, device, args.fp16, cache_dir)
+        val_metrics = evaluate(
+            classifier,
+            encoder,
+            val_loader,
+            device,
+            args.fp16,
+            cache_dir,
+            threshold=args.threshold,
+        )
+        if args.threshold_grid:
+            best_grid_f1 = val_metrics["f1"]
+            best_grid_threshold = args.threshold
+            for threshold in args.threshold_grid:
+                grid_metrics = evaluate(
+                    classifier,
+                    encoder,
+                    val_loader,
+                    device,
+                    args.fp16,
+                    cache_dir,
+                    threshold=threshold,
+                )
+                if grid_metrics["f1"] > best_grid_f1:
+                    best_grid_f1 = grid_metrics["f1"]
+                    best_grid_threshold = threshold
+            if best_grid_threshold != args.threshold:
+                val_metrics = evaluate(
+                    classifier,
+                    encoder,
+                    val_loader,
+                    device,
+                    args.fp16,
+                    cache_dir,
+                    threshold=best_grid_threshold,
+                )
+            best_threshold = best_grid_threshold
         scheduler.step(val_metrics["f1"])
         print(
             "epoch={epoch} loss={loss:.4f} val_acc={acc:.4f} val_f1={f1:.4f}"
@@ -467,7 +506,15 @@ def train(args: argparse.Namespace) -> None:
 
     if best_path.exists():
         classifier.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
-    test_metrics = evaluate(classifier, encoder, test_loader, device, args.fp16, cache_dir)
+    test_metrics = evaluate(
+        classifier,
+        encoder,
+        test_loader,
+        device,
+        args.fp16,
+        cache_dir,
+        threshold=best_threshold,
+    )
     print(
         "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}"
         " test_macro_f1={macro_f1:.4f} test_balanced_acc={balanced_acc:.4f} test_mcc={mcc:.4f}".format(
@@ -506,6 +553,14 @@ if __name__ == "__main__":
     parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for CE loss.")
     parser.add_argument("--focal-gamma", type=float, default=0.0, help="Use focal loss when > 0.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping (0 to disable).")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Decision threshold for positive class.")
+    parser.add_argument(
+        "--threshold-grid",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Optional list of thresholds to scan on validation data.",
+    )
     parser.add_argument(
         "--feature-cache",
         default=None,
