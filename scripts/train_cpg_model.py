@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from hashlib import sha1
 from contextlib import nullcontext
 from pathlib import Path
 from statistics import mean
@@ -32,6 +33,25 @@ def load_entries(jsonl_path: Path) -> List[Dict[str, object]]:
         for line in handle:
             entries.append(json.loads(line))
     return entries
+
+
+def load_cache_index(cache_dir: Path) -> Dict[str, str]:
+    index_path = cache_dir / "index.jsonl"
+    if not index_path.exists():
+        return {}
+    mapping: Dict[str, str] = {}
+    with index_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            if "path" in obj and "file" in obj:
+                mapping[str(obj["path"])] = str(obj["file"])
+    return mapping
+
+
+def cache_key(path: str) -> str:
+    return sha1(path.encode("utf-8")).hexdigest()
 
 
 def summarize_graphs(entries: List[Dict[str, object]]) -> Dict[str, float]:
@@ -85,7 +105,7 @@ def build_graph(
     entry: Dict[str, object],
     relation_map: Dict[str, int],
     max_nodes: int,
-) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[int]]:
     nodes = entry["nodes"]
     edges = entry["edges"]
     total_nodes = len(nodes)
@@ -107,31 +127,53 @@ def build_graph(
     if not filtered_edges:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         edge_types = torch.zeros((0,), dtype=torch.long)
-        return node_texts, edge_index, edge_types
+        return node_texts, edge_index, edge_types, keep_indices
 
     edge_index = torch.tensor(
         [[index_map[edge[0]] for edge in filtered_edges], [index_map[edge[1]] for edge in filtered_edges]],
         dtype=torch.long,
     )
     edge_types = torch.tensor([relation_map[edge[2]] for edge in filtered_edges], dtype=torch.long)
-    return node_texts, edge_index, edge_types
+    return node_texts, edge_index, edge_types, keep_indices
 
 
-def collate_batch(tokenizer, relation_map, max_nodes: int, max_length: int, batch):
+def load_cached_embeddings(entry: Dict[str, object], cache_dir: Path, cache_index: Dict[str, str]) -> torch.Tensor:
+    path = str(entry.get("path", ""))
+    cache_name = cache_index.get(path)
+    if not cache_name:
+        cache_name = f"{cache_key(path)}.pt"
+    cache_path = cache_dir / cache_name
+    if not cache_path.exists():
+        raise FileNotFoundError(f"Missing cache file for {path}: {cache_path}")
+    data = torch.load(cache_path, map_location="cpu")
+    if isinstance(data, dict) and "embeddings" in data:
+        return data["embeddings"]
+    if torch.is_tensor(data):
+        return data
+    raise ValueError(f"Unsupported cache format at {cache_path}")
+
+
+def collate_batch(tokenizer, relation_map, max_nodes: int, max_length: int, batch, cache_dir, cache_index):
     graphs = []
     labels = []
     for entry in batch:
-        node_texts, edge_index, edge_types = build_graph(entry, relation_map, max_nodes)
-        if not node_texts:
-            node_texts = [entry.get("path", "<empty>")]
-        tokens = tokenizer(
-            node_texts,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        graphs.append((tokens, edge_index, edge_types))
+        node_texts, edge_index, edge_types, keep_indices = build_graph(entry, relation_map, max_nodes)
+        if cache_dir:
+            embeddings = load_cached_embeddings(entry, cache_dir, cache_index)
+            if keep_indices:
+                embeddings = embeddings[keep_indices]
+            graphs.append((embeddings, edge_index, edge_types))
+        else:
+            if not node_texts:
+                node_texts = [entry.get("path", "<empty>")]
+            tokens = tokenizer(
+                node_texts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            graphs.append((tokens, edge_index, edge_types))
         labels.append(entry.get("label", 0))
     return graphs, torch.tensor(labels, dtype=torch.long)
 
@@ -156,6 +198,7 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
     use_fp16: bool,
+    cache_dir: Path | None,
 ) -> dict:
     classifier.eval()
     encoder.eval()
@@ -166,9 +209,12 @@ def evaluate(
         for graphs, labels in dataloader:
             labels = labels.to(device)
             logits_list = []
-            for tokens, edge_index, edge_types in graphs:
-                tokens = {k: v.to(device) for k, v in tokens.items()}
-                node_embeddings = encoder(**tokens).last_hidden_state[:, 0, :]
+            for node_inputs, edge_index, edge_types in graphs:
+                if cache_dir:
+                    node_embeddings = node_inputs.to(device)
+                else:
+                    tokens = {k: v.to(device) for k, v in node_inputs.items()}
+                    node_embeddings = encoder(**tokens).last_hidden_state[:, 0, :]
                 graph = CPGGraph(
                     node_embeddings=node_embeddings,
                     edge_index=edge_index.to(device),
@@ -204,6 +250,9 @@ def train(args: argparse.Namespace) -> None:
                 f" empty_edges={int(stats['empty_edges'])}"
             )
 
+    cache_dir = Path(args.feature_cache) if args.feature_cache else None
+    cache_index = load_cache_index(cache_dir) if cache_dir else {}
+
     train_loader = DataLoader(
         CPGJsonDataset(train_entries),
         batch_size=args.batch_size,
@@ -214,6 +263,8 @@ def train(args: argparse.Namespace) -> None:
             args.max_nodes,
             args.max_length,
             batch,
+            cache_dir,
+            cache_index,
         ),
     )
     val_loader = DataLoader(
@@ -226,6 +277,8 @@ def train(args: argparse.Namespace) -> None:
             args.max_nodes,
             args.max_length,
             batch,
+            cache_dir,
+            cache_index,
         ),
     )
     test_loader = DataLoader(
@@ -238,6 +291,8 @@ def train(args: argparse.Namespace) -> None:
             args.max_nodes,
             args.max_length,
             batch,
+            cache_dir,
+            cache_index,
         ),
     )
 
@@ -261,10 +316,13 @@ def train(args: argparse.Namespace) -> None:
         for graphs, labels in train_loader:
             labels = labels.to(device)
             logits_list = []
-            for tokens, edge_index, edge_types in graphs:
-                tokens = {k: v.to(device) for k, v in tokens.items()}
-                with torch.no_grad(), autocast():
-                    node_embeddings = encoder(**tokens).last_hidden_state[:, 0, :]
+            for node_inputs, edge_index, edge_types in graphs:
+                if cache_dir:
+                    node_embeddings = node_inputs.to(device)
+                else:
+                    tokens = {k: v.to(device) for k, v in node_inputs.items()}
+                    with torch.no_grad(), autocast():
+                        node_embeddings = encoder(**tokens).last_hidden_state[:, 0, :]
                 graph = CPGGraph(
                     node_embeddings=node_embeddings,
                     edge_index=edge_index.to(device),
@@ -278,7 +336,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer.step()
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
-        val_metrics = evaluate(classifier, encoder, val_loader, device, args.fp16)
+        val_metrics = evaluate(classifier, encoder, val_loader, device, args.fp16, cache_dir)
         print(
             "epoch={epoch} loss={loss:.4f} val_acc={acc:.4f} val_f1={f1:.4f}"
             " val_precision={precision:.4f} val_recall={recall:.4f}".format(
@@ -289,7 +347,7 @@ def train(args: argparse.Namespace) -> None:
         )
         classifier.train()
 
-    test_metrics = evaluate(classifier, encoder, test_loader, device, args.fp16)
+    test_metrics = evaluate(classifier, encoder, test_loader, device, args.fp16, cache_dir)
     print(
         "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}".format(
             **test_metrics
@@ -314,6 +372,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-length", type=int, default=64, help="Max token length per node text.")
     parser.add_argument("--max-nodes", type=int, default=256, help="Max nodes per graph (0 disables).")
     parser.add_argument("--fp16", action="store_true", help="Enable fp16 autocast for the encoder.")
+    parser.add_argument(
+        "--feature-cache",
+        default=None,
+        help="Directory with cached node embeddings (created by cache_cpg_embeddings.py).",
+    )
     parser.add_argument(
         "--class-weight",
         choices=["none", "auto"],

@@ -69,6 +69,28 @@ This also uses a default 80/10/10 train/val/test split with `--train-ratio`, `--
 If you hit GPU OOM, reduce `--batch-size`, lower `--max-length`, cap nodes per graph with `--max-nodes`, or enable `--fp16`.
 For class imbalance or collapsed predictions, `--class-weight auto` enables inverse-frequency weights, and `--log-graph-stats` prints node/edge summary stats per split.
 
+### Optional: cache CodeBERT node embeddings for faster training
+
+```bash
+python scripts/cache_cpg_embeddings.py \
+  --cpg-jsonl /home/user/mzaj/FCG/outputs/cpg/cpg.jsonl \
+  --model-path /home/user/PycharmProjects/pythonProject/model/codebert-base \
+  --output-dir /home/user/mzaj/FCG/outputs/cpg/cache \
+  --max-length 128 \
+  --node-batch-size 64 \
+  --fp16
+```
+
+Then train using the cache:
+
+```bash
+python scripts/train_cpg_model.py \
+  --cpg-jsonl /home/user/mzaj/FCG/outputs/cpg/cpg.jsonl \
+  --model-path /home/user/PycharmProjects/pythonProject/model/codebert-base \
+  --output-dir /home/user/mzaj/FCG/outputs/cpg \
+  --feature-cache /home/user/mzaj/FCG/outputs/cpg/cache
+```
+
 ## Notes
 
 - The CPG model learns **relation weights** (AST/CFG/CDG/DDG/DOMINATE/POST_DOMINATE/REF by default) and can be extended later with deeper GNN layers or graph pooling.
