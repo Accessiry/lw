@@ -234,7 +234,52 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor, threshold: float
         "fn": float(fn),
         "tn": float(tn),
         "threshold": threshold,
+        "mean_prob_pos": float(probs[:, 1].mean().item()) if probs.numel() else 0.0,
     }
+
+
+def select_threshold(
+    classifier: CPGClassifier,
+    encoder: AutoModel,
+    dataloader: DataLoader,
+    device: torch.device,
+    use_fp16: bool,
+    cache_dir: Path | None,
+    thresholds: List[float],
+    optimize_metric: str,
+    min_precision: float,
+) -> Tuple[float, dict]:
+    best_threshold = thresholds[0]
+    best_metrics = {}
+    best_score = -1.0
+    for threshold in thresholds:
+        metrics = evaluate(
+            classifier,
+            encoder,
+            dataloader,
+            device,
+            use_fp16,
+            cache_dir,
+            threshold=threshold,
+        )
+        if min_precision and metrics["precision"] < min_precision:
+            continue
+        score = metrics.get(optimize_metric, metrics["f1"])
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+            best_metrics = metrics
+    if not best_metrics:
+        best_metrics = evaluate(
+            classifier,
+            encoder,
+            dataloader,
+            device,
+            use_fp16,
+            cache_dir,
+            threshold=thresholds[0],
+        )
+    return best_threshold, best_metrics
 
 
 def evaluate(
@@ -452,37 +497,22 @@ def train(args: argparse.Namespace) -> None:
             threshold=args.threshold,
         )
         if args.threshold_grid:
-            best_grid_f1 = val_metrics["f1"]
-            best_grid_threshold = args.threshold
-            for threshold in args.threshold_grid:
-                grid_metrics = evaluate(
-                    classifier,
-                    encoder,
-                    val_loader,
-                    device,
-                    args.fp16,
-                    cache_dir,
-                    threshold=threshold,
-                )
-                if grid_metrics["f1"] > best_grid_f1:
-                    best_grid_f1 = grid_metrics["f1"]
-                    best_grid_threshold = threshold
-            if best_grid_threshold != args.threshold:
-                val_metrics = evaluate(
-                    classifier,
-                    encoder,
-                    val_loader,
-                    device,
-                    args.fp16,
-                    cache_dir,
-                    threshold=best_grid_threshold,
-                )
-            best_threshold = best_grid_threshold
+            best_threshold, val_metrics = select_threshold(
+                classifier,
+                encoder,
+                val_loader,
+                device,
+                args.fp16,
+                cache_dir,
+                thresholds=args.threshold_grid,
+                optimize_metric=args.optimize_metric,
+                min_precision=args.min_precision,
+            )
         scheduler.step(val_metrics["f1"])
         print(
             "epoch={epoch} loss={loss:.4f} val_acc={acc:.4f} val_f1={f1:.4f}"
             " val_precision={precision:.4f} val_recall={recall:.4f} val_macro_f1={macro_f1:.4f}"
-            " val_balanced_acc={balanced_acc:.4f} val_mcc={mcc:.4f}".format(
+            " val_balanced_acc={balanced_acc:.4f} val_mcc={mcc:.4f} val_threshold={threshold:.2f}".format(
                 epoch=epoch + 1,
                 loss=avg_loss,
                 **val_metrics,
@@ -560,6 +590,18 @@ if __name__ == "__main__":
         nargs="*",
         default=None,
         help="Optional list of thresholds to scan on validation data.",
+    )
+    parser.add_argument(
+        "--optimize-metric",
+        choices=["f1", "precision", "acc", "macro_f1", "balanced_acc", "mcc"],
+        default="f1",
+        help="Metric to optimize when scanning thresholds.",
+    )
+    parser.add_argument(
+        "--min-precision",
+        type=float,
+        default=0.0,
+        help="Minimum precision required when selecting a threshold.",
     )
     parser.add_argument(
         "--feature-cache",
