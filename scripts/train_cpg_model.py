@@ -145,7 +145,7 @@ def load_cached_embeddings(entry: Dict[str, object], cache_dir: Path, cache_inde
     cache_path = cache_dir / cache_name
     if not cache_path.exists():
         raise FileNotFoundError(f"Missing cache file for {path}: {cache_path}")
-    data = torch.load(cache_path, map_location="cpu")
+    data = torch.load(cache_path, map_location="cpu", weights_only=True)
     if isinstance(data, dict) and "embeddings" in data:
         return data["embeddings"]
     if torch.is_tensor(data):
@@ -309,12 +309,25 @@ def train(args: argparse.Namespace) -> None:
     encoder.eval()
 
     optimizer = torch.optim.AdamW(classifier.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=max(args.early_stop_patience // 2, 1),
+        min_lr=1e-6,
+    )
     class_weights = None
     if args.class_weight == "auto":
         class_weights = build_class_weights(train_entries).to(device)
     loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 
     classifier.train()
+    best_val_f1 = -1.0
+    best_epoch = -1
+    epochs_without_improve = 0
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    best_path = output_dir / "cpg_classifier_best.pt"
     for epoch in range(args.epochs):
         total_loss = 0.0
         autocast = torch.cuda.amp.autocast if args.fp16 and device.type == "cuda" else nullcontext
@@ -342,6 +355,7 @@ def train(args: argparse.Namespace) -> None:
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader) if len(train_loader) else 0.0
         val_metrics = evaluate(classifier, encoder, val_loader, device, args.fp16, cache_dir)
+        scheduler.step(val_metrics["f1"])
         print(
             "epoch={epoch} loss={loss:.4f} val_acc={acc:.4f} val_f1={f1:.4f}"
             " val_precision={precision:.4f} val_recall={recall:.4f}".format(
@@ -350,8 +364,20 @@ def train(args: argparse.Namespace) -> None:
                 **val_metrics,
             )
         )
+        if val_metrics["f1"] > best_val_f1:
+            best_val_f1 = val_metrics["f1"]
+            best_epoch = epoch + 1
+            torch.save(classifier.state_dict(), best_path)
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+            if args.early_stop_patience and epochs_without_improve >= args.early_stop_patience:
+                print(f"early_stop=1 best_epoch={best_epoch} best_val_f1={best_val_f1:.4f}")
+                break
         classifier.train()
 
+    if best_path.exists():
+        classifier.load_state_dict(torch.load(best_path, map_location=device))
     test_metrics = evaluate(classifier, encoder, test_loader, device, args.fp16, cache_dir)
     print(
         "test_acc={acc:.4f} test_f1={f1:.4f} test_precision={precision:.4f} test_recall={recall:.4f}".format(
@@ -359,8 +385,6 @@ def train(args: argparse.Namespace) -> None:
         )
     )
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     classifier_path = output_dir / "cpg_classifier.pt"
     torch.save(classifier.state_dict(), classifier_path)
     print(f"saved: {classifier_path}")
@@ -374,6 +398,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--early-stop-patience", type=int, default=3, help="Stop if val_f1 stops improving.")
     parser.add_argument("--gnn-layers", type=int, default=2, help="Number of GNN layers.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout for GNN and classifier.")
     parser.add_argument("--max-length", type=int, default=64, help="Max token length per node text.")
