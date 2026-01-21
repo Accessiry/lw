@@ -5,6 +5,7 @@ import json
 import random
 from contextlib import nullcontext
 from pathlib import Path
+from statistics import mean
 from typing import Dict, List, Tuple
 
 import torch
@@ -31,6 +32,38 @@ def load_entries(jsonl_path: Path) -> List[Dict[str, object]]:
         for line in handle:
             entries.append(json.loads(line))
     return entries
+
+
+def summarize_graphs(entries: List[Dict[str, object]]) -> Dict[str, float]:
+    node_counts = [len(entry.get("nodes", [])) for entry in entries]
+    edge_counts = [len(entry.get("edges", [])) for entry in entries]
+    empty_nodes = sum(1 for count in node_counts if count == 0)
+    empty_edges = sum(1 for count in edge_counts if count == 0)
+    return {
+        "graphs": float(len(entries)),
+        "nodes_min": float(min(node_counts)) if node_counts else 0.0,
+        "nodes_max": float(max(node_counts)) if node_counts else 0.0,
+        "nodes_mean": float(mean(node_counts)) if node_counts else 0.0,
+        "edges_min": float(min(edge_counts)) if edge_counts else 0.0,
+        "edges_max": float(max(edge_counts)) if edge_counts else 0.0,
+        "edges_mean": float(mean(edge_counts)) if edge_counts else 0.0,
+        "empty_nodes": float(empty_nodes),
+        "empty_edges": float(empty_edges),
+    }
+
+
+def build_class_weights(entries: List[Dict[str, object]]) -> torch.Tensor:
+    counts = {0: 0, 1: 0}
+    for entry in entries:
+        label = int(entry.get("label", 0))
+        if label in counts:
+            counts[label] += 1
+    total = counts[0] + counts[1]
+    if total == 0:
+        return torch.tensor([1.0, 1.0], dtype=torch.float32)
+    weight_0 = total / max(counts[0], 1)
+    weight_1 = total / max(counts[1], 1)
+    return torch.tensor([weight_0, weight_1], dtype=torch.float32)
 
 
 def split_entries(
@@ -161,6 +194,15 @@ def train(args: argparse.Namespace) -> None:
         val_ratio=args.val_ratio,
         seed=args.seed,
     )
+    if args.log_graph_stats:
+        for name, subset in (("train", train_entries), ("val", val_entries), ("test", test_entries)):
+            stats = summarize_graphs(subset)
+            print(
+                f"[{name}] graphs={int(stats['graphs'])} nodes(min/mean/max)={stats['nodes_min']:.0f}"
+                f"/{stats['nodes_mean']:.1f}/{stats['nodes_max']:.0f} edges(min/mean/max)={stats['edges_min']:.0f}"
+                f"/{stats['edges_mean']:.1f}/{stats['edges_max']:.0f} empty_nodes={int(stats['empty_nodes'])}"
+                f" empty_edges={int(stats['empty_edges'])}"
+            )
 
     train_loader = DataLoader(
         CPGJsonDataset(train_entries),
@@ -207,7 +249,10 @@ def train(args: argparse.Namespace) -> None:
     encoder.eval()
 
     optimizer = torch.optim.AdamW(classifier.parameters(), lr=args.lr)
-    loss_fn = torch.nn.CrossEntropyLoss()
+    class_weights = None
+    if args.class_weight == "auto":
+        class_weights = build_class_weights(train_entries).to(device)
+    loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 
     classifier.train()
     for epoch in range(args.epochs):
@@ -269,6 +314,17 @@ if __name__ == "__main__":
     parser.add_argument("--max-length", type=int, default=64, help="Max token length per node text.")
     parser.add_argument("--max-nodes", type=int, default=256, help="Max nodes per graph (0 disables).")
     parser.add_argument("--fp16", action="store_true", help="Enable fp16 autocast for the encoder.")
+    parser.add_argument(
+        "--class-weight",
+        choices=["none", "auto"],
+        default="auto",
+        help="Class weighting strategy for imbalanced data.",
+    )
+    parser.add_argument(
+        "--log-graph-stats",
+        action="store_true",
+        help="Print per-split node/edge statistics before training.",
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
